@@ -4,15 +4,26 @@ import torch.nn as nn
 from updates import build_update_method
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, trunc_normal_
+from updates.integrators import euler_step, rk2_step, rk4_step
+
+integrators = {
+    "euler": euler_step,
+    "rk2": rk2_step,
+    "rk4": rk4_step
+}
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
+        # encoder 
         self.fc1 = nn.Linear(in_features, hidden_features)
+        # physics-aware activation
         self.act = act_layer()
+        # gnn
         self.fc2 = nn.Linear(hidden_features, out_features)
+        # decoder
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -38,6 +49,7 @@ class EmbeddingBlock(nn.Module):
 
         return node, edge
 
+# 节点->边->节点的更新函数
 class GraphConnectionBlock(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, 
                  drop_rate=0., norm_layer=nn.LayerNorm):
@@ -50,18 +62,19 @@ class GraphConnectionBlock(nn.Module):
         self.mlpEdge = Mlp(in_features=3 * in_features, hidden_features=3 * hidden_features, out_features=out_features, drop=drop_rate)
         self.mlpNode = Mlp(in_features=2 * in_features, hidden_features=2 * hidden_features, out_features=out_features, drop=drop_rate)
 
-
     def forward(self, node, edge, edgeIdx, edge2node):  # (B, N_e, D) / (B, N_n, D)
         B = node.size(0)
         N_n = node.size(1)
         N_e = edge.size(1)
+        # 保存残差
         shortcut_edge = edge
         shortcut_node = node
 
+        # 计算边特征
         edge = shortcut_node[:, edgeIdx].flatten(2)   # (B, N_e, 2, D) → (B, N_e, 2D)
         edge = torch.cat([shortcut_edge, edge], dim=2)  # (B, N_e, 3D)
         # del node2edge
-
+        # 更新边特征
         edge = self.norm1(edge)
         edge = self.mlpEdge(edge).transpose(0, 1).flatten(1).half() # (B, N_e, D) → (N_e, B*D)
 
@@ -69,15 +82,16 @@ class GraphConnectionBlock(nn.Module):
         node = torch.cat([shortcut_node, node], dim=2)  # (B, N_n, 2D)
         edge = edge.reshape(N_e, B, -1).transpose(0, 1)
         # del edge2node
-
+        # 更新节点特征
         node = self.norm2(node)
         node = self.mlpNode(node)
-
+        # 残差输出
         edge = shortcut_edge + edge
         node = shortcut_node + node
 
         return node, edge
-    
+
+# 节点直接聚合邻居节点的更新函数
 class GraphConvolutionBlock(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, adj=None, norm_layer=nn.LayerNorm, drop_rate=0.):
@@ -91,18 +105,21 @@ class GraphConvolutionBlock(nn.Module):
         self.Mlp2 = Mlp(2 * in_features, hidden_features, out_features, drop=drop_rate)
 
     def forward(self, node, edge, adj):
+        # 不使用edge
         B = node.size(0)
         N_n = node.size(1)
-
+        
+        # 节点自身更新
         shortcut = node    # (B, N, in_chans)
         node = self.norm1(node)
         node = self.Mlp1(node) + shortcut
 
         shortcut = node
 
+        # 节点邻居聚合更新
         node = node.transpose(0, 1).flatten(1).half()   # (B, N, hidden_chans) → (N, B*in_features)
         node = torch.sparse.mm(adj, node).reshape(N_n, B,-1).transpose(0, 1) # (B, N, in_features)
-
+        # 拼接邻居节点特征
         node = torch.cat([shortcut, node], dim=2).type_as(shortcut)
         node = self.norm2(node)
         node = self.Mlp2(node) + shortcut
@@ -111,6 +128,7 @@ class GraphConvolutionBlock(nn.Module):
     def __repr__(self):
         return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
 
+# 最小单元
 class BasicBlock(nn.Module):
 
     def __init__(self, dim, mlp_ratio, drop_rate):
@@ -119,11 +137,13 @@ class BasicBlock(nn.Module):
         self.GraphConvolution = GraphConvolutionBlock(in_features=dim, hidden_features=int(mlp_ratio * dim), out_features=dim, drop_rate=drop_rate)
 
     def forward(self, node, edge, edgeIdx, edge2node, adj):
+        # 相互作用更新
         node, edge = self.GraphConnection(node, edge, edgeIdx, edge2node)
+        # 扩散更新
         node, edge = self.GraphConvolution(node, edge, adj)
         return node, edge
 
-
+# 多次小时间步长更新速度场
 class BasicLayer(nn.Module):
 
     def __init__(self, dim, depth, drop_rate=0.0, 
@@ -137,6 +157,7 @@ class BasicLayer(nn.Module):
         self.blocks = nn.ModuleList([BasicBlock(dim=dim, mlp_ratio=mlp_ratio, drop_rate=drop_rate)
             for i in range(depth)])
 
+        # 上采样或下采样
         if dim_up:
             self.processNode = Mlp(in_features=dim, hidden_features=dim, out_features=2 * dim, drop=drop_rate)
             self.processEdge = Mlp(in_features=dim, hidden_features=dim, out_features=2 * dim, drop=drop_rate)
@@ -166,10 +187,12 @@ class Model(nn.Module):
                  drop_rate=0., norm_layer=nn.LayerNorm):
         super(Model, self).__init__()
 
+        # 物理结构
         self.edgeIdx = edgeIdx
         self.edge2node = edge2node
         self.edgeStates = edgeStates
         self.adj = adj
+        
         self.embed= EmbeddingBlock(embed_dim)
 
         self.backbone_num_layers = len(backbone_depths)
@@ -177,7 +200,7 @@ class Model(nn.Module):
         self.backbone_num_features = int(embed_dim * 2 ** (self.backbone_num_layers - 1))
         self.branch_num_features = [int(self.backbone_num_features * 2 ** -(self.branch_num_layers[i] - 1)) for i in range(len(branch_depths))]
 
-        # build backbone_layers
+        # 主干网络
         self.Backbone = nn.ModuleList()
         for i_layer in range(self.backbone_num_layers):
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer), depth=backbone_depths[i_layer], 
@@ -185,6 +208,7 @@ class Model(nn.Module):
                                dim_up = True if (i_layer < self.backbone_num_layers - 1) else None)
             self.Backbone.append(layer)
 
+        # 预测速度
         self.VelocityBranch = nn.ModuleList()
         for i_layer in range(self.branch_num_layers[0]):
             layer = BasicLayer(dim=int(self.backbone_num_features * 2 ** -i_layer), depth=branch_depths[0][i_layer],
@@ -194,6 +218,7 @@ class Model(nn.Module):
         self.velocity_norm = norm_layer(self.branch_num_features[0])
         self.velocity_head = Mlp(in_features=self.branch_num_features[0], hidden_features=self.branch_num_features[0], out_features=10)
 
+        # 预测交互项
         self.InteractionBranch = nn.ModuleList()
         for i_layer in range(self.branch_num_layers[1]):
             layer = BasicLayer(dim=int(self.backbone_num_features * 2 ** -i_layer), depth=branch_depths[1][i_layer],
@@ -245,7 +270,9 @@ class Model(nn.Module):
         return node
 
     def forward(self, dataStates, constants):
+        # 输入生成
         node, edge = self.inputGeneration(dataStates, constants)
+        # 主干网络特征提取
         node, edge = self.backbone_forward_features(node, edge)
 
         node_iv = self.VelocityBranch_forward_features(node, edge)
@@ -256,7 +283,7 @@ class Model(nn.Module):
 
         node_iv = self.velocity_head(node_iv)
         node_pp = self.interaction_head(node_pp)
-
+        # 返回给update
         return node_iv, node_pp
 
 class PASSAT(nn.Module):
@@ -271,9 +298,14 @@ class PASSAT(nn.Module):
         self.updateMethod = build_update_method(config)
         self.mesh = config.DATA.LAT_LON_MESH[0]
         self.constants = config.DATA.CONSTANTS[0]
+        self.config = config
+        self.integrator = integrators[config.EXP.INTEGRATOR]
+        self.dt = config.EXP.DT
+        # self.method = config.UPDATE.SPACE_METHOD
+        # self.lmax = config.UPDATE.LMAX
 
     def forward(self, dataStates, step):
-        updatedData, updatedVelocity = self.updateMethod(self.mesh, self.constants, dataStates, self.model, step)  # (T, B, 5, 32, 64)
+        updatedData, updatedVelocity = self.updateMethod(self.mesh, self.constants, dataStates, self.model, step, self.config, self.integrator, self.dt)  # (T, B, 5, 32, 64)
         return updatedData, updatedVelocity
 
 

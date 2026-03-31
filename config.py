@@ -43,7 +43,9 @@ _C.MODEL.OUTPUT = ''
 _C.MODEL.MAX_STEP = None
 _C.MODEL.LAYERNORM = False
 
-
+_C.EXP = CN()
+_C.EXP.INTEGRATOR = "rk4"   # euler | rk2 | rk4
+_C.EXP.DT = 0.01               # float
 # -----------------------------------------------------------------------------
 # PASSAT settings
 # -----------------------------------------------------------------------------
@@ -54,6 +56,12 @@ _C.MODEL.PASSAT.BRANCH_DEPTHS = None
 _C.MODEL.PASSAT.LAMBDA_VELOCITY_VALUE = None
 _C.MODEL.PASSAT.LAMBDA_VELOCITY_GRAD = 1
 
+# ------------------------------------------------------------------
+# UPDATE / SPACE OPERATOR CONFIG
+# ------------------------------------------------------------------
+_C.UPDATE = CN()
+_C.UPDATE.SPACE_METHOD = "fd"   # fd | fvm | spectral_sh
+_C.UPDATE.LMAX = 15             # 球谐最高阶（仅 spectral_sh 使用）
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
@@ -113,12 +121,12 @@ def _update_config_from_file(config, cfg_file):
     config.merge_from_file(cfg_file)
     config.freeze()
 
-def update_config(config, args):
+def update_config(config, args, opts=None):
     _update_config_from_file(config, args.cfg)
 
     config.defrost()
-    if args.opts:
-        config.merge_from_list(args.opts)
+    if opts is not None:
+        config.merge_from_list(opts)
 
     def _check_args(name):
         if hasattr(args, name) and eval(f'args.{name}'):
@@ -139,12 +147,12 @@ def update_config(config, args):
 
     config.freeze()
 
-def get_config(args):
+def get_config(args, opts=None):
     """Get a yacs CfgNode object with default values."""
     # Return a clone so that the defaults will not be altered
     # This is for the "local variable" use pattern
     config = _C.clone()
-    update_config(config, args)
+    update_config(config, args, opts)
 
     return config
 

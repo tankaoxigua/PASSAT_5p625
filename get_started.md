@@ -128,8 +128,19 @@ python -m torch.distributed.run --nproc_per_node 4 --master_port 12345 main.py \
 --cfg configs/PASSAT.yaml
 ```
 
+## Custom Training Commands
 
+### Training with Different Numerical Methods
 
+We provide additional training commands for experiments with different numerical discretization methods:
 
+#### Euler + Spectral Harmonics (dt=0.2)
 
+```bash
+python -u -m torch.distributed.run --nproc_per_node 4 --master_port 12345 main.py \
+  --cfg configs/PASSAT.yaml \
+  --space_method spectral_sh \
+  --lmax 15 \
+  --opts EXP.INTEGRATOR euler EXP.DT 0.2 
+```
 

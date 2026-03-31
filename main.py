@@ -19,6 +19,19 @@ from lr_scheduler import build_scheduler
 from data import build_loader, get_adjacency
 from criterion import Criterion, Validation
 from utils import load_checkpoint, load_pretrained, SavingTool, NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor, beautiful_metrics, Tensor_AverageMeter
+from experiment_logger import ExperimentLogger
+# 储存不同的实验输出路径
+def build_exp_output(config):
+    method = config.UPDATE.SPACE_METHOD
+    l = config.UPDATE.LMAX
+    integrator = config.EXP.INTEGRATOR
+    dt = config.EXP.DT
+    
+    if integrator== "SPECTRAL_SH":
+        exp_name = f"{method}_lmax{l}_{integrator}_dt{dt}"
+    else:
+        exp_name = f"{method}_{integrator}_dt{dt}"
+    return os.path.join(config.MODEL.OUTPUT, exp_name)
 
 def parse_option():
     parser = argparse.ArgumentParser('Model training and evaluation script', add_help=False)
@@ -52,16 +65,34 @@ def parse_option():
     ## overwrite optimizer in config (*.yaml) if specified, e.g., fused_adam/fused_lamb
     parser.add_argument('--optim', type=str,
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
-
+    parser.add_argument("--space_method", default=None, choices=["FDM", "FVM", "SPECTRAL_SH"], help="override UPDATE.SPACE_METHOD")
+    parser.add_argument("--lmax", type=int, default=None, help="override UPDATE.LMAX for SH method")
     args, unparsed = parser.parse_known_args()
 
-    config = get_config(args)
+    opts = args.opts if args.opts is not None else []
+
+    if args.space_method is not None:
+        opts += ["UPDATE.SPACE_METHOD", args.space_method]
+
+    if args.lmax is not None:
+        opts += ["UPDATE.LMAX", str(args.lmax)]
+
+    config = get_config(args, opts)
 
     return args, config
 
 def main(config):
     
     local_rank = int(os.environ["RANK"])
+
+    # 加载日志工具
+    if dist.get_rank() == 0:
+        csv_logger = ExperimentLogger(
+            os.path.join(config.MODEL.OUTPUT, "numerical_experiment.csv")
+        )
+    else:
+        csv_logger = None
+
     dataset_train, dataset_val, dataset_test, data_loader_train, data_loader_val, data_loader_test = build_loader(config, local_rank)
     adj_mat, edge_mat = get_adjacency(config.MODEL.KERNEL_ALPHA, 5)
     adj_mat, edge_mat = adj_mat.to_sparse_csr().half().cuda(), edge_mat.to_sparse_csr().half().cuda()
@@ -146,18 +177,48 @@ def main(config):
     logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
+        # 统计每个epoch的时间
+        epoch_start = time.time()
+        # 统计每个epoch的显存
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, data_loader_train, model, criterion, optimizer, epoch, lr_scheduler, loss_scaler, step=config.TRAIN_STEP)
 
         rmse, std_rmse, acc = validate(config, validation, data_loader_val, model, step=config.TRAIN_STEP)
             
+        epoch_time = time.time() - epoch_start
+
         rmse_frame, std_rmse_frame, acc_frame = beautiful_metrics(config, rmse, std_rmse, acc, step=config.TRAIN_STEP)
         
         logger.info(f"--------rmse of the network on the {len(dataset_val)} validation--------")
         logger.info(rmse_frame)
 
+        torch.cuda.synchronize()
         mean_std_rmse = std_rmse[:, 5].mean()
+        mem_alloc = torch.cuda.memory_allocated() / 1024**2
+        mem_peak  = torch.cuda.max_memory_allocated() / 1024**2
+        mean_rmse = rmse.mean().item()
+        mean_acc = acc.mean().item()
+            
+        if dist.get_rank() == 0:
+
+            csv_logger.log({
+                "epoch": epoch,
+                "space_method": config.UPDATE.SPACE_METHOD,
+                "lmax": config.UPDATE.LMAX,
+                "integrator": config.EXP.INTEGRATOR,
+                "dt": config.EXP.DT,
+                "step": config.TRAIN_STEP,
+                "rmse": mean_rmse,
+                "std_rmse": mean_std_rmse,
+                "acc": mean_acc,
+                "alloc_mem_MB": mem_alloc,
+                "peak_mem_MB": mem_peak,
+                "time_per_epoch": epoch_time
+            })
 
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             savingTool(config, epoch, model_without_ddp, mean_std_rmse, optimizer, lr_scheduler, loss_scaler, logger)
@@ -183,14 +244,18 @@ def train_one_epoch(config, data_loader, model, criterion, optimizer,
     start = time.time()
     end = time.time()
     for idx, (dataStates, dataInfo, targetStates) in enumerate(data_loader):
+        # 读入历史天气
         dataStates = dataStates.cuda(non_blocking=True) # (B, 5, 32, 64)
         targetStates = targetStates.transpose(0, 1).cuda(non_blocking=True)[0:step] # (B, T, 5, 32, 64) 2 (T, B, 5, 32, 64)
 
+        # 模型预测未来天气
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             predict_dataStates, predict_velocity = model(dataStates, step)
             loss, dist, distVel = criterion.forward(predict_dataStates, targetStates, predict_velocity)
+            # 计算损失
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
         
+        # 反向传播，梯度更新
         norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD, parameters=model.parameters(), create_graph=False,
                             update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
@@ -201,6 +266,7 @@ def train_one_epoch(config, data_loader, model, criterion, optimizer,
 
         torch.cuda.synchronize()
 
+        # 更新模型参数
         loss_meter.update(loss.item(), targetStates.size(1))
         dist_meter.update(dist.item(), targetStates.size(1))
         if distVel: distVel_meter.update(distVel.item(), targetStates.size(1))
@@ -210,10 +276,12 @@ def train_one_epoch(config, data_loader, model, criterion, optimizer,
         batch_time.update(time.time() - end)
         end = time.time()
 
+        # 打印训练信息
         if idx % config.PRINT_FREQ == 0:
             lr = optimizer.param_groups[0]['lr']
             wd = optimizer.param_groups[0]['weight_decay']
-            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            mem_alloc = torch.cuda.memory_allocated() / 1024**2
+            mem_peak  = torch.cuda.max_memory_allocated() / 1024**2
             etas = batch_time.avg * (num_steps - idx)
             logger.info(
                 f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
@@ -224,7 +292,8 @@ def train_one_epoch(config, data_loader, model, criterion, optimizer,
                 f'distVel {distVel_meter.val:.7f} ({distVel_meter.avg:.7f})\t'
                 f'model_grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'loss_scale {scaler_meter.val:.5f} ({scaler_meter.avg:.5f})\t'
-                f'mem {memory_used:.0f}MB\t'
+                f'mem {mem_alloc:.0f}MB\t'
+                f'peak_mem {mem_peak:.0f}MB\t'
                 f'step:{step}')
 
     epoch_time = time.time() - start
@@ -300,6 +369,12 @@ if __name__ == '__main__':
     random.seed(seed)
     cudnn.benchmark = True
 
+    exp_output = build_exp_output(config)
+
+    config.defrost()
+    config.MODEL.OUTPUT = exp_output
+    config.freeze()
+    
     os.makedirs(config.MODEL.OUTPUT, exist_ok=True)
     logger = create_logger(output_dir=config.MODEL.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.TYPE}")
 
